@@ -1,0 +1,77 @@
+plugins {
+    id 'fabric-loom' version "${loom_version}"
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+base.archivesName = project.archives_base_name
+
+repositories {
+    mavenCentral()
+    maven { url 'https://repo.maven.apache.org/maven2/' }
+}
+
+// Configuration for libraries that we want shaded (relocated) into the final mod jar
+configurations {
+    shadeOnly
+    implementation.extendsFrom shadeOnly
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // Shaded JDBC stack
+    shadeOnly 'org.mariadb.jdbc:mariadb-java-client:3.4.1'
+    shadeOnly 'com.zaxxer:HikariCP:5.1.0'
+    shadeOnly 'org.slf4j:slf4j-api:2.0.13'
+}
+
+processResources {
+    inputs.property "version", project.version
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+shadowJar {
+    archiveClassifier.set('shadow-dev')
+    configurations = [project.configurations.shadeOnly]
+    // Rewrite META-INF/services/* file names and contents so that ServiceLoader
+    // can still find the relocated classes (java.sql.Driver, MariaDB plugins, etc).
+    mergeServiceFiles()
+    // Relocate to prevent conflicts if another mod ships the same libs.
+    relocate 'org.mariadb', 'com.cobblehub.questsync.libs.mariadb'
+    relocate 'com.zaxxer.hikari', 'com.cobblehub.questsync.libs.hikari'
+    relocate 'org.slf4j', 'com.cobblehub.questsync.libs.slf4j'
+    // Drop META-INF signatures that would break repackaging.
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+    exclude 'META-INF/versions/9/module-info.class'
+}
+
+remapJar {
+    dependsOn shadowJar
+    inputFile.set(shadowJar.archiveFile)
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.archives_base_name}" }
+    }
+}

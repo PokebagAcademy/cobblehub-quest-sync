@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "cobblehub_quest_sync",
+  "version": "${version}",
+  "name": "CobbleHub Quest Sync",
+  "description": "Cross-server quest progression sync, MySQL-backed flags, and first-join teleport for the CobbleHub network.",
+  "authors": ["CobbleHub"],
+  "license": "All Rights Reserved",
+  "environment": "server",
+  "entrypoints": {
+    "main": [
+      "com.cobblehub.questsync.CobblehubQuestSyncMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "custom": {
+    "modmenu": {
+      "badges": ["library"]
+    }
+  }
+}

@@ -1,0 +1,21 @@
+# Build outputs
+build/
+.gradle/
+out/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.fleet/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gradle wrapper jar is needed but kept out of repo for now (recreated via `gradle wrapper`)
+gradle/wrapper/dists/
+
+# Logs
+*.log
+run/

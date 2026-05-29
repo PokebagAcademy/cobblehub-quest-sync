@@ -13,6 +13,12 @@ repositories {
     maven { url 'https://repo.maven.apache.org/maven2/' }
 }
 
+// Local jars used at compile time only. These mods are already installed on the
+// production servers, so we don't bundle them. They live under libs/ and are
+// committed at the project root, so the repo builds end-to-end without external
+// auth (FTB's saps.dev maven currently 404s for fabric artifacts).
+configurations { modLocal }
+
 // Configuration for libraries that we want shaded (relocated) into the final mod jar
 configurations {
     shadeOnly
@@ -24,6 +30,17 @@ dependencies {
     mappings loom.officialMojangMappings()
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // Compile-only deps. We DO NOT ship these in our jar — they are already installed
+    // on the server. modCompileOnly means: available at compile time, remapped to our
+    // mappings by Loom, but not packed into our output and not pulled at runtime.
+    // Source jars live in libs/ (committed to the repo).
+    modCompileOnly files(
+            'libs/architectury-13.0.8-fabric.jar',
+            'libs/ftb-library-fabric-2101.1.31.jar',
+            'libs/ftb-teams-fabric-2101.1.9.jar',
+            'libs/ftb-quests-fabric-2101.1.24.jar'
+    )
 
     // Shaded JDBC stack
     shadeOnly 'org.mariadb.jdbc:mariadb-java-client:3.4.1'

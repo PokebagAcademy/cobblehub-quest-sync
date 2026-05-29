@@ -12,8 +12,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Entry point for the CobblehubQuestSync mod. Loads the config, opens the DB pool,
- * registers event listeners. v0 only ships the first-join teleport feature;
- * quest sync hooks land in a later version once FTB Quests events are wired in.
+ * registers event listeners. v0.2 adds FTB Quests progression sync on top of the
+ * v0.1 first-join teleport.
  */
 public final class CobblehubQuestSyncMod implements ModInitializer {
 
@@ -31,11 +31,12 @@ public final class CobblehubQuestSyncMod implements ModInitializer {
 
     private Config config;
     private Database database;
+    private QuestSyncListener questSync;
 
     @Override
     public void onInitialize() {
         instance = this;
-        LOGGER.info("CobblehubQuestSync v0 starting...");
+        LOGGER.info("CobblehubQuestSync v0.2 starting...");
 
         this.config = Config.loadOrCreate();
         LOGGER.info("Loaded config. serverName='{}', mysql.enabled={}, firstJoin.enabled={}, firstJoin.flagKey='{}'",
@@ -61,6 +62,14 @@ public final class CobblehubQuestSyncMod implements ModInitializer {
 
         new PlayerJoinHandler(this).register();
 
+        // FTB Quests sync. The listener is registered unconditionally — internally it
+        // no-ops when MySQL is disabled — because Architectury events are static and
+        // cannot be safely unregistered. The listener hooks both ObjectCompletedEvent
+        // (capture) and TeamEvent.PLAYER_LOGGED_IN (replay), so no extra wiring from
+        // PlayerJoinHandler is needed.
+        this.questSync = new QuestSyncListener(this);
+        this.questSync.register();
+
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
             LOGGER.info("Server stopping — shutting down CobblehubQuestSync...");
             if (database != null) {
@@ -77,11 +86,12 @@ public final class CobblehubQuestSyncMod implements ModInitializer {
             }
         });
 
-        LOGGER.info("CobblehubQuestSync v0 ready.");
+        LOGGER.info("CobblehubQuestSync v0.2 ready.");
     }
 
     public Config config() { return config; }
     public Database database() { return database; }
+    public QuestSyncListener questSync() { return questSync; }
 
     public static CobblehubQuestSyncMod get() { return instance; }
 

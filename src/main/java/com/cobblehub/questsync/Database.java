@@ -100,6 +100,46 @@ public final class Database implements AutoCloseable {
         }
     }
 
+    // ---------------- Quest progress ----------------
+
+    /**
+     * Marks a single task as completed for a player. Idempotent — re-running for the same
+     * (player, task) updates {@code last_updated} and {@code last_server} but does not
+     * regress completion.
+     */
+    public void recordTaskCompleted(UUID playerUuid, String taskId, String serverName) throws SQLException {
+        String sql = "INSERT INTO " + cfg.tablePrefix + "quest_progress "
+                + "(player_uuid, task_id, progress, completed, last_server) "
+                + "VALUES (?, ?, 1, 1, ?) "
+                + "ON DUPLICATE KEY UPDATE completed = 1, progress = GREATEST(progress, 1), "
+                + "last_updated = CURRENT_TIMESTAMP, last_server = VALUES(last_server)";
+        try (Connection c = pool.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, playerUuid.toString());
+            ps.setString(2, taskId);
+            ps.setString(3, serverName);
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Returns the set of task IDs the given player has completed on any server.
+     * Task IDs are stored as their hex string form (the FTB Quests-stable representation).
+     */
+    public java.util.Set<String> getCompletedTaskIds(UUID playerUuid) throws SQLException {
+        String sql = "SELECT task_id FROM " + cfg.tablePrefix + "quest_progress "
+                + "WHERE player_uuid = ? AND completed = 1";
+        java.util.Set<String> out = new java.util.HashSet<>();
+        try (Connection c = pool.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, playerUuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(rs.getString(1));
+                }
+            }
+        }
+        return out;
+    }
+
     @Override
     public void close() {
         if (pool != null && !pool.isClosed()) {

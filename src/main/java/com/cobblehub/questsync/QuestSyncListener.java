@@ -30,12 +30,16 @@ import java.util.UUID;
  *       from the database and force-complete the corresponding tasks on this server's
  *       team data via {@link TeamData#setCompleted(long, Date)}, then cascade the
  *       completion up to the parent quest and chapter.</li>
- *   <li><b>Reward-claim bookkeeping (v0.2.3):</b> after the cascade, pre-populate this
- *       server's local {@code claimedRewards} map for every reward of every quest we
- *       just synced. Without this, FTB's own {@code checkQuestBookOnLogin} would see
+ *   <li><b>Reward-claim bookkeeping:</b> after the cascade, pre-populate this server's
+ *       local {@code claimedRewards} map for every reward of every quest we just synced.
+ *       Without this, FTB's own {@code checkQuestBookOnLogin} would see
  *       "quest complete + reward not in claimedRewards" the next login and auto-claim
  *       the reward again — a clean duplicate.</li>
  * </ol>
+ * <p>
+ * v0.2.4: the method we need for step 3 was renamed in FTB Quests 2101.1.20
+ * (claimReward → markRewardAsClaimed). We use reflection to resolve the right one at
+ * runtime so the mod works against any 2101.1.x point release.
  */
 public final class QuestSyncListener {
 
@@ -47,14 +51,6 @@ public final class QuestSyncListener {
 
     public void register() {
         ObjectCompletedEvent.TASK.register(this::onTaskCompleted);
-        // Replay hook. We use FTB Teams' own PLAYER_LOGGED_IN event because it is
-        // guaranteed to fire AFTER the player's team data has been initialised and
-        // synchronised — exactly when we need it. FTB Quests also hooks this same
-        // event for its checkQuestBookOnLogin sweep; since FTB Quests is a dependency,
-        // it loads (and registers) before us, so its listener runs first on each
-        // invocation. That's why we pre-populate claimedRewards on every cascade
-        // (see step 3 of the class doc) — so the NEXT login won't trigger duplicate
-        // auto-claims.
         TeamEvent.PLAYER_LOGGED_IN.register(event -> replayForPlayer(event.getPlayer()));
         CobblehubQuestSyncMod.LOGGER.info("Registered FTB Quests event listeners (capture + replay).");
     }
@@ -185,27 +181,23 @@ public final class QuestSyncListener {
         // data.checkAutoCompletion(quest). For any quest that's marked complete
         // locally but whose reward isn't in this server's local claimedRewards map,
         // FTB happily auto-claims it again — that's how players were getting
-        // duplicate diamonds. We pre-populate the claimedRewards map for every
-        // reward of every quest we've touched, as long as that quest is now
-        // considered complete locally.
+        // duplicate diamonds.
         //
-        // We iterate the FULL affectedQuests set (not just newly-completed ones)
-        // so that this also heals leftover state from v0.2.2 — quests that ended
-        // up complete on this server but whose rewards never got marked. The
-        // markRewardAsClaimed call is idempotent (no-op if already in the set).
-        //
-        // This applies to MANUAL rewards too: by marking them claimed locally,
-        // the "Claim Reward" button is disabled on this server. The cost is that
-        // a player who completes a task on server A but switches to server B
-        // before clicking Claim will only be able to claim on A — they have to
-        // go back. That's an acceptable trade-off; the alternative is duplication.
+        // The method we need was RENAMED between 2101.1.15 and 2101.1.20:
+        //   - 2101.1.0  → 2101.1.15: TeamData.claimReward(UUID, Reward, long)
+        //   - 2101.1.20 → 2101.1.24: TeamData.markRewardAsClaimed(UUID, Reward, long)
+        // Behaviour is identical: puts the entry into the internal claimedRewards
+        // map without actually giving the player the item. We resolve the right
+        // method via reflection so this mod works on any 2101.1.x point release —
+        // a hard call to either symbol would NoSuchMethodError on the other half
+        // of the version range (v0.2.3 did exactly that and crashed the server).
         long nowMs = now.getTime();
         int rewardsMarked = 0;
         UUID uuid = player.getUUID();
         for (Quest quest : affectedQuests) {
             if (quest == null || !teamData.isCompleted(quest)) continue;
             for (Reward reward : quest.getRewards()) {
-                if (teamData.markRewardAsClaimed(uuid, reward, nowMs)) {
+                if (markRewardClaimedCompat(teamData, uuid, reward, nowMs)) {
                     rewardsMarked++;
                 }
             }
@@ -218,6 +210,8 @@ public final class QuestSyncListener {
         }
     }
 
+    // ---------------- ID encoding helpers ----------------
+
     private static String idToHex(long id) {
         return String.format("%016X", id);
     }
@@ -227,6 +221,66 @@ public final class QuestSyncListener {
             return Long.parseUnsignedLong(hex, 16);
         } catch (NumberFormatException e) {
             return null;
+        }
+    }
+
+    // ---------------- Cross-version FTB reflection ----------------
+
+    /** Cached reflective handle to the "mark this reward as already claimed" method on TeamData. */
+    private static volatile java.lang.reflect.Method markRewardClaimedMethod;
+    /** Set to true once we've attempted resolution, even if it failed — avoids retrying every login. */
+    private static volatile boolean markRewardClaimedResolved = false;
+
+    /**
+     * Records a reward as already-claimed in TeamData without giving the player the item.
+     * The underlying FTB Quests method was renamed between 2101.1.15 and 2101.1.20:
+     * the old name was {@code claimReward(UUID, Reward, long)}, the new one is
+     * {@code markRewardAsClaimed(UUID, Reward, long)}. We resolve the right symbol on
+     * first call via reflection and cache the result, so this mod is compatible with
+     * any 2101.1.x point release without recompilation.
+     *
+     * @return true if the reward was newly added to the claimed set; false if it was
+     *         already there or if neither method could be found.
+     */
+    private static boolean markRewardClaimedCompat(TeamData teamData, UUID player, Reward reward, long when) {
+        if (!markRewardClaimedResolved) {
+            synchronized (QuestSyncListener.class) {
+                if (!markRewardClaimedResolved) {
+                    java.lang.reflect.Method m = null;
+                    // Try the newer name first (2101.1.20+, which is what most up-to-date
+                    // servers will run). Fall back to the older one if it's missing.
+                    for (String n : new String[] { "markRewardAsClaimed", "claimReward" }) {
+                        try {
+                            java.lang.reflect.Method candidate = TeamData.class.getMethod(n, UUID.class, Reward.class, long.class);
+                            if (candidate.getReturnType() == boolean.class) {
+                                m = candidate;
+                                CobblehubQuestSyncMod.LOGGER.info(
+                                        "Resolved FTB Quests reward-claim method as TeamData.{}(UUID, Reward, long).", n);
+                                break;
+                            }
+                        } catch (NoSuchMethodException ignored) {
+                            // Try the next name.
+                        }
+                    }
+                    if (m == null) {
+                        CobblehubQuestSyncMod.LOGGER.warn(
+                                "Could not find any TeamData reward-claim method (markRewardAsClaimed or claimReward). "
+                                + "Reward duplication prevention is disabled — players may claim rewards on multiple servers.");
+                    }
+                    markRewardClaimedMethod = m;
+                    markRewardClaimedResolved = true;
+                }
+            }
+        }
+
+        if (markRewardClaimedMethod == null) return false;
+
+        try {
+            Object result = markRewardClaimedMethod.invoke(teamData, player, reward, when);
+            return result instanceof Boolean && (Boolean) result;
+        } catch (Throwable t) {
+            CobblehubQuestSyncMod.LOGGER.error("Failed to invoke reward-claim method via reflection.", t);
+            return false;
         }
     }
 }

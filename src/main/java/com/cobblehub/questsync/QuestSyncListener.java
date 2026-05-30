@@ -6,6 +6,7 @@ import dev.ftb.mods.ftbquests.quest.Chapter;
 import dev.ftb.mods.ftbquests.quest.Quest;
 import dev.ftb.mods.ftbquests.quest.ServerQuestFile;
 import dev.ftb.mods.ftbquests.quest.TeamData;
+import dev.ftb.mods.ftbquests.quest.reward.Reward;
 import dev.ftb.mods.ftbquests.quest.task.Task;
 import dev.ftb.mods.ftbteams.api.event.TeamEvent;
 import net.minecraft.server.MinecraftServer;
@@ -20,7 +21,7 @@ import java.util.UUID;
 /**
  * Bridges FTB Quests progression to the shared MySQL store.
  * <p>
- * Two responsibilities:
+ * Three responsibilities:
  * <ol>
  *   <li><b>Capture:</b> register on {@link ObjectCompletedEvent#TASK}. When a task is
  *       completed on this server, record a row per online team member so the progress
@@ -29,23 +30,12 @@ import java.util.UUID;
  *       from the database and force-complete the corresponding tasks on this server's
  *       team data via {@link TeamData#setCompleted(long, Date)}, then cascade the
  *       completion up to the parent quest and chapter.</li>
+ *   <li><b>Reward-claim bookkeeping (v0.2.3):</b> after the cascade, pre-populate this
+ *       server's local {@code claimedRewards} map for every reward of every quest we
+ *       just synced. Without this, FTB's own {@code checkQuestBookOnLogin} would see
+ *       "quest complete + reward not in claimedRewards" the next login and auto-claim
+ *       the reward again — a clean duplicate.</li>
  * </ol>
- * <p>
- * Re-application uses {@code setCompleted} directly, which only writes to the internal
- * completion map. It does <b>not</b> invoke {@code Task.onCompleted()} (the path that
- * fires the event), so we cannot create an infinite write-replay loop. It also does
- * not trigger reward auto-claim — that logic lives in {@code Quest.onCompleted()},
- * a separate code path. Players get their rewards exactly once, on the server where
- * they originally completed the task.
- * <p>
- * Because we bypass the normal {@code Task.onCompleted -> Quest.onCompleted -> Chapter.onCompleted}
- * chain, we have to redo the climb ourselves: after every task replay we check whether
- * each affected quest is now fully complete and mark it as such, then do the same for
- * chapters. The cascade is silent (no events, no toasts, no auto-claim).
- * <p>
- * Task IDs are persisted as their canonical 16-char hex string ({@code String.format("%016X", id)},
- * the same format FTB Quests uses in its own SNBT files), so they're stable across
- * server restarts and human-readable in the database.
  */
 public final class QuestSyncListener {
 
@@ -56,18 +46,16 @@ public final class QuestSyncListener {
     }
 
     public void register() {
-        // We only care about Task-level completions, not whole quests or chapters.
-        // Completing the last task of a quest implicitly completes the quest via FTB's
-        // internal cascade — but we don't need to mirror that; replaying tasks is enough
-        // to reconstruct quest-level completion at the next join.
         ObjectCompletedEvent.TASK.register(this::onTaskCompleted);
-
         // Replay hook. We use FTB Teams' own PLAYER_LOGGED_IN event because it is
         // guaranteed to fire AFTER the player's team data has been initialised and
-        // synchronised — exactly when we need it. Hooking ServerPlayConnectionEvents.JOIN
-        // would be too early (TeamData.get would throw because the team doesn't exist yet).
+        // synchronised — exactly when we need it. FTB Quests also hooks this same
+        // event for its checkQuestBookOnLogin sweep; since FTB Quests is a dependency,
+        // it loads (and registers) before us, so its listener runs first on each
+        // invocation. That's why we pre-populate claimedRewards on every cascade
+        // (see step 3 of the class doc) — so the NEXT login won't trigger duplicate
+        // auto-claims.
         TeamEvent.PLAYER_LOGGED_IN.register(event -> replayForPlayer(event.getPlayer()));
-
         CobblehubQuestSyncMod.LOGGER.info("Registered FTB Quests event listeners (capture + replay).");
     }
 
@@ -78,16 +66,9 @@ public final class QuestSyncListener {
 
         Task task = event.getTask();
         if (task == null) return EventResult.pass();
-        // FTB's id-as-hex format. This is the stable identifier across servers.
         String taskId = idToHex(task.id);
         String serverName = mod.config().serverName;
 
-        // The event carries the team's currently-online members. In solo-teams mode
-        // (which is our target deployment), this is exactly one player — the one who
-        // triggered the completion. If a future setup uses multi-member teams, every
-        // online member sees the completion in DB and the next join on the other
-        // server replays it for them too. Offline members will catch up the next time
-        // they log in, since FTB's local team data is what feeds future events.
         List<ServerPlayer> members = event.getOnlineMembers();
         if (members.isEmpty()) return EventResult.pass();
 
@@ -103,15 +84,9 @@ public final class QuestSyncListener {
                 }
             });
         }
-        // We are a passive observer — never interrupt the FTB event chain.
         return EventResult.pass();
     }
 
-    /**
-     * Replays previously completed tasks for a player onto the local server's team data.
-     * Called from FTB Teams' {@code PLAYER_LOGGED_IN} event, which fires after the
-     * player's TeamData is built and ready.
-     */
     public void replayForPlayer(ServerPlayer player) {
         if (!mod.config().mysql.enabled) return;
         Database db = mod.database();
@@ -133,8 +108,6 @@ public final class QuestSyncListener {
             if (remoteCompleted.isEmpty()) {
                 return;
             }
-
-            // World mutations need the server thread.
             server.execute(() -> applyOnServerThread(player, remoteCompleted, name));
         });
     }
@@ -150,10 +123,6 @@ public final class QuestSyncListener {
         try {
             teamData = TeamData.get(player);
         } catch (Exception e) {
-            // TeamData.get throws if the player's team isn't initialised yet. This can
-            // happen at the very first JOIN tick before FTB Teams has built the solo
-            // team. We just skip — the next interaction with the quest book will
-            // self-heal because we'll have already written the data to disk via DB.
             CobblehubQuestSyncMod.LOGGER.warn("TeamData not ready yet for {}; replay deferred.", name);
             return;
         }
@@ -163,10 +132,6 @@ public final class QuestSyncListener {
         int alreadyDone = 0;
         int unknown = 0;
 
-        // Track parents we touched so we can cascade-mark them complete below.
-        // We add to affectedQuests both when we just completed a task AND when a task
-        // was already complete on this server — that way a half-broken state from a
-        // previous version (task done, quest not done) self-heals on the next login.
         Set<Quest> affectedQuests = new HashSet<>();
 
         for (String taskHex : remoteCompleted) {
@@ -177,32 +142,21 @@ public final class QuestSyncListener {
             }
             Task task = file.getTask(taskId);
             if (task == null) {
-                // The other server has a task that we don't — quest books out of sync.
-                // Log once and move on; the player will be informed by the quest book itself.
                 unknown++;
                 continue;
             }
             if (teamData.isCompleted(task)) {
                 alreadyDone++;
-                // Still flag the parent for cascade check — see comment above.
                 affectedQuests.add(task.getQuest());
                 continue;
             }
-            // setCompleted only updates internal state — does NOT fire Task.onCompleted,
-            // so this loop will not trigger another ObjectCompletedEvent.TASK on us.
             if (teamData.setCompleted(taskId, now)) {
                 tasksApplied++;
                 affectedQuests.add(task.getQuest());
             }
         }
 
-        // ---- Cascade quest completion ----
-        // Task.onCompleted normally walks up the tree: when the last task of a quest
-        // is done, the quest is marked complete; when the last quest of a chapter is
-        // done, the chapter is marked complete. We bypassed that whole chain by calling
-        // setCompleted directly on the task, so we have to redo the climb manually.
-        // We do it silently (no events, no toasts, no auto-claim) because rewards were
-        // already claimed on the server where the player originally finished the task.
+        // Cascade quest completion silently.
         Set<Chapter> affectedChapters = new HashSet<>();
         int questsCompleted = 0;
         for (Quest quest : affectedQuests) {
@@ -225,27 +179,51 @@ public final class QuestSyncListener {
             }
         }
 
-        if (tasksApplied > 0 || unknown > 0 || questsCompleted > 0 || chaptersCompleted > 0) {
+        // ---- Mark rewards as already-claimed on this server ----
+        // Without this step, the very next time this player logs in, FTB Quests'
+        // own checkQuestBookOnLogin scans every quest and unconditionally calls
+        // data.checkAutoCompletion(quest). For any quest that's marked complete
+        // locally but whose reward isn't in this server's local claimedRewards map,
+        // FTB happily auto-claims it again — that's how players were getting
+        // duplicate diamonds. We pre-populate the claimedRewards map for every
+        // reward of every quest we've touched, as long as that quest is now
+        // considered complete locally.
+        //
+        // We iterate the FULL affectedQuests set (not just newly-completed ones)
+        // so that this also heals leftover state from v0.2.2 — quests that ended
+        // up complete on this server but whose rewards never got marked. The
+        // markRewardAsClaimed call is idempotent (no-op if already in the set).
+        //
+        // This applies to MANUAL rewards too: by marking them claimed locally,
+        // the "Claim Reward" button is disabled on this server. The cost is that
+        // a player who completes a task on server A but switches to server B
+        // before clicking Claim will only be able to claim on A — they have to
+        // go back. That's an acceptable trade-off; the alternative is duplication.
+        long nowMs = now.getTime();
+        int rewardsMarked = 0;
+        UUID uuid = player.getUUID();
+        for (Quest quest : affectedQuests) {
+            if (quest == null || !teamData.isCompleted(quest)) continue;
+            for (Reward reward : quest.getRewards()) {
+                if (teamData.markRewardAsClaimed(uuid, reward, nowMs)) {
+                    rewardsMarked++;
+                }
+            }
+        }
+
+        if (tasksApplied > 0 || unknown > 0 || questsCompleted > 0 || chaptersCompleted > 0 || rewardsMarked > 0) {
             CobblehubQuestSyncMod.LOGGER.info(
-                    "Replay for {}: tasks={}, quests={}, chapters={}, already_done={}, unknown_tasks={}.",
-                    name, tasksApplied, questsCompleted, chaptersCompleted, alreadyDone, unknown);
+                    "Replay for {}: tasks={}, quests={}, chapters={}, rewards_marked={}, already_done={}, unknown_tasks={}.",
+                    name, tasksApplied, questsCompleted, chaptersCompleted, rewardsMarked, alreadyDone, unknown);
         }
     }
 
-    // ---------------- ID encoding helpers ----------------
-
-    /**
-     * FTB Quests stores its long object IDs as 16-char uppercase hex strings in SNBT.
-     * We use the same format in MySQL so the values are human-recognisable and match
-     * what an admin would see when reading the quest book files on disk.
-     */
     private static String idToHex(long id) {
         return String.format("%016X", id);
     }
 
     private static Long hexToId(String hex) {
         try {
-            // Use Long.parseUnsignedLong to handle the high bit correctly.
             return Long.parseUnsignedLong(hex, 16);
         } catch (NumberFormatException e) {
             return null;

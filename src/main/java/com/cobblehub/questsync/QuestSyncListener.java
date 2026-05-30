@@ -2,6 +2,8 @@ package com.cobblehub.questsync;
 
 import dev.architectury.event.EventResult;
 import dev.ftb.mods.ftbquests.events.ObjectCompletedEvent;
+import dev.ftb.mods.ftbquests.quest.Chapter;
+import dev.ftb.mods.ftbquests.quest.Quest;
 import dev.ftb.mods.ftbquests.quest.ServerQuestFile;
 import dev.ftb.mods.ftbquests.quest.TeamData;
 import dev.ftb.mods.ftbquests.quest.task.Task;
@@ -10,6 +12,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -24,7 +27,8 @@ import java.util.UUID;
  *       follows them across the network.</li>
  *   <li><b>Replay:</b> at player join, fetch the player's previously completed task IDs
  *       from the database and force-complete the corresponding tasks on this server's
- *       team data via {@link TeamData#setCompleted(long, Date)}.</li>
+ *       team data via {@link TeamData#setCompleted(long, Date)}, then cascade the
+ *       completion up to the parent quest and chapter.</li>
  * </ol>
  * <p>
  * Re-application uses {@code setCompleted} directly, which only writes to the internal
@@ -34,10 +38,14 @@ import java.util.UUID;
  * a separate code path. Players get their rewards exactly once, on the server where
  * they originally completed the task.
  * <p>
- * Task IDs are persisted as their canonical 16-char hex string ({@code Long.toHexString}
- * with the FTB convention of uppercase, zero-padded). That string is stable across
- * server restarts and matches what FTB writes in its own SNBT files, so it's the
- * right identifier to share between two servers running the same quest book.
+ * Because we bypass the normal {@code Task.onCompleted -> Quest.onCompleted -> Chapter.onCompleted}
+ * chain, we have to redo the climb ourselves: after every task replay we check whether
+ * each affected quest is now fully complete and mark it as such, then do the same for
+ * chapters. The cascade is silent (no events, no toasts, no auto-claim).
+ * <p>
+ * Task IDs are persisted as their canonical 16-char hex string ({@code String.format("%016X", id)},
+ * the same format FTB Quests uses in its own SNBT files), so they're stable across
+ * server restarts and human-readable in the database.
  */
 public final class QuestSyncListener {
 
@@ -101,8 +109,8 @@ public final class QuestSyncListener {
 
     /**
      * Replays previously completed tasks for a player onto the local server's team data.
-     * Called from {@link PlayerJoinHandler} after any first-join teleport is resolved,
-     * so the player is in the right world before progression catches up.
+     * Called from FTB Teams' {@code PLAYER_LOGGED_IN} event, which fires after the
+     * player's TeamData is built and ready.
      */
     public void replayForPlayer(ServerPlayer player) {
         if (!mod.config().mysql.enabled) return;
@@ -151,9 +159,15 @@ public final class QuestSyncListener {
         }
 
         Date now = new Date();
-        int applied = 0;
+        int tasksApplied = 0;
         int alreadyDone = 0;
         int unknown = 0;
+
+        // Track parents we touched so we can cascade-mark them complete below.
+        // We add to affectedQuests both when we just completed a task AND when a task
+        // was already complete on this server — that way a half-broken state from a
+        // previous version (task done, quest not done) self-heals on the next login.
+        Set<Quest> affectedQuests = new HashSet<>();
 
         for (String taskHex : remoteCompleted) {
             Long taskId = hexToId(taskHex);
@@ -170,19 +184,51 @@ public final class QuestSyncListener {
             }
             if (teamData.isCompleted(task)) {
                 alreadyDone++;
+                // Still flag the parent for cascade check — see comment above.
+                affectedQuests.add(task.getQuest());
                 continue;
             }
             // setCompleted only updates internal state — does NOT fire Task.onCompleted,
             // so this loop will not trigger another ObjectCompletedEvent.TASK on us.
             if (teamData.setCompleted(taskId, now)) {
-                applied++;
+                tasksApplied++;
+                affectedQuests.add(task.getQuest());
             }
         }
 
-        if (applied > 0 || unknown > 0) {
+        // ---- Cascade quest completion ----
+        // Task.onCompleted normally walks up the tree: when the last task of a quest
+        // is done, the quest is marked complete; when the last quest of a chapter is
+        // done, the chapter is marked complete. We bypassed that whole chain by calling
+        // setCompleted directly on the task, so we have to redo the climb manually.
+        // We do it silently (no events, no toasts, no auto-claim) because rewards were
+        // already claimed on the server where the player originally finished the task.
+        Set<Chapter> affectedChapters = new HashSet<>();
+        int questsCompleted = 0;
+        for (Quest quest : affectedQuests) {
+            if (quest == null) continue;
+            if (!teamData.isCompleted(quest) && quest.isCompletedRaw(teamData)) {
+                if (teamData.setCompleted(quest.id, now)) {
+                    questsCompleted++;
+                    affectedChapters.add(quest.getChapter());
+                }
+            }
+        }
+
+        int chaptersCompleted = 0;
+        for (Chapter chapter : affectedChapters) {
+            if (chapter == null) continue;
+            if (!teamData.isCompleted(chapter) && chapter.isCompletedRaw(teamData)) {
+                if (teamData.setCompleted(chapter.id, now)) {
+                    chaptersCompleted++;
+                }
+            }
+        }
+
+        if (tasksApplied > 0 || unknown > 0 || questsCompleted > 0 || chaptersCompleted > 0) {
             CobblehubQuestSyncMod.LOGGER.info(
-                    "Replay for {}: applied={}, already_done={}, unknown_tasks={}.",
-                    name, applied, alreadyDone, unknown);
+                    "Replay for {}: tasks={}, quests={}, chapters={}, already_done={}, unknown_tasks={}.",
+                    name, tasksApplied, questsCompleted, chaptersCompleted, alreadyDone, unknown);
         }
     }
 

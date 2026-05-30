@@ -42,10 +42,20 @@ dependencies {
             'libs/ftb-quests-fabric-2101.1.24.jar'
     )
 
-    // Shaded JDBC stack
-    shadeOnly 'org.mariadb.jdbc:mariadb-java-client:3.4.1'
-    shadeOnly 'com.zaxxer:HikariCP:5.1.0'
-    shadeOnly 'org.slf4j:slf4j-api:2.0.13'
+    // Shaded JDBC stack. Note: we deliberately do NOT shade SLF4J. Minecraft already
+    // provides org.slf4j on the runtime classpath (via log4j-slf4j2-impl), so our code
+    // and the shaded HikariCP/MariaDB references to org.slf4j.LoggerFactory will resolve
+    // to Minecraft's logger system and our messages show up in the server log.
+    // If we shaded and relocated SLF4J ourselves, the relocated copy would find no
+    // service provider and silently fall back to a NOP logger (v0.2.0 had this bug).
+    // We also exclude SLF4J from MariaDB's transitive deps so it isn't bundled at all.
+    shadeOnly('org.mariadb.jdbc:mariadb-java-client:3.4.1') {
+        exclude group: 'org.slf4j'
+    }
+    shadeOnly('com.zaxxer:HikariCP:5.1.0') {
+        exclude group: 'org.slf4j'
+    }
+    compileOnly 'org.slf4j:slf4j-api:2.0.13'
 }
 
 processResources {
@@ -72,9 +82,12 @@ shadowJar {
     // can still find the relocated classes (java.sql.Driver, MariaDB plugins, etc).
     mergeServiceFiles()
     // Relocate to prevent conflicts if another mod ships the same libs.
+    // Important: we deliberately do NOT relocate org.slf4j — references inside the
+    // shaded HikariCP and MariaDB bytecode keep pointing at the real org.slf4j package,
+    // which is provided at runtime by Minecraft. That way Hikari/MariaDB's own logs
+    // (and ours) flow into the normal server log.
     relocate 'org.mariadb', 'com.cobblehub.questsync.libs.mariadb'
     relocate 'com.zaxxer.hikari', 'com.cobblehub.questsync.libs.hikari'
-    relocate 'org.slf4j', 'com.cobblehub.questsync.libs.slf4j'
     // Drop META-INF signatures that would break repackaging.
     exclude 'META-INF/*.SF'
     exclude 'META-INF/*.DSA'

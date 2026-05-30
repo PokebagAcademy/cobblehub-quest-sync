@@ -13,7 +13,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Entry point for the CobblehubQuestSync mod. Loads the config, opens the DB pool,
  * registers event listeners. v0.2 adds FTB Quests progression sync on top of the
- * v0.1 first-join teleport.
+ * v0.1 first-join teleport. v0.2.1 fixes a silent-logger bug where our shaded+
+ * relocated SLF4J found no provider and NOP'd every log call.
  */
 public final class CobblehubQuestSyncMod implements ModInitializer {
 
@@ -36,7 +37,7 @@ public final class CobblehubQuestSyncMod implements ModInitializer {
     @Override
     public void onInitialize() {
         instance = this;
-        LOGGER.info("CobblehubQuestSync v0.2 starting...");
+        LOGGER.info("CobblehubQuestSync v0.2.1 starting...");
 
         this.config = Config.loadOrCreate();
         LOGGER.info("Loaded config. serverName='{}', mysql.enabled={}, firstJoin.enabled={}, firstJoin.flagKey='{}'",
@@ -86,7 +87,7 @@ public final class CobblehubQuestSyncMod implements ModInitializer {
             }
         });
 
-        LOGGER.info("CobblehubQuestSync v0.2 ready.");
+        LOGGER.info("CobblehubQuestSync v0.2.1 ready.");
     }
 
     public Config config() { return config; }

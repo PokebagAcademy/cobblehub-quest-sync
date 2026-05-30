@@ -1,6 +1,6 @@
 # Release process
 
-This document captures the manual release flow used until we set up CI.
+Manual flow used until CI is set up.
 
 ## Build locally
 
@@ -8,45 +8,81 @@ This document captures the manual release flow used until we set up CI.
 ./gradlew clean build
 ```
 
-Produces `build/libs/cobblehub-quest-sync-<version>.jar` (the remapped, shaded jar — the one to ship). A `-shadow-dev` jar is also produced as an intermediate; ignore it.
+Produces `build/libs/cobblehub-quest-sync-<version>.jar` — the remapped, shaded jar to ship.
+A `-shadow-dev` jar is also produced as an intermediate; ignore it.
+
+### Verifying the jar
+
+A correctly-built jar contains:
+- Our 5 mod classes under `com/cobblehub/questsync/`
+- ~430 shaded classes under `com/cobblehub/questsync/libs/` (MariaDB connector + HikariCP)
+- **Zero** classes under `dev/ftb/mods/`, `dev/architectury/`, or `org/slf4j/`
+
+Quick check:
+```bash
+JAR=build/libs/cobblehub-quest-sync-<version>.jar
+unzip -l "$JAR" | grep -cE 'dev/ftb/mods|dev/architectury|org/slf4j'   # should be 0
+unzip -l "$JAR" | grep -cE 'libs/(mariadb|hikari)'                       # should be ~430
+unzip -p "$JAR" fabric.mod.json | jq .depends                            # ftbquests, ftblibrary, ftbteams, architectury
+```
 
 ## Deploy to the CobbleHub network
 
-The panel's `sftp_upload_from_url` requires an HTTPS source. Until we host releases on GitHub Releases, the flow is:
+The panel's `sftp_upload_from_url` requires HTTPS. Until releases are hosted on GitHub Releases:
 
-1. Upload the jar to a temporary file host that accepts `.zip` (e.g. litterbox.catbox.moe with `time=1h`).
-2. From the panel, call `sftp_upload_from_url` against each backend:
-   - `CobbleHub` → `mods/cobblehub-quest-sync-<version>.jar`
-   - `CobbleHub_Monde` → `mods/cobblehub-quest-sync-<version>.jar`
-3. Remove the previous version's jar from `mods/` on each backend (file name change is enough — Fabric matches by mod id, not file name, but stale jars cause loader warnings).
-4. Restart each backend in turn. **Main first**, then Monde.
+1. Upload the jar to a temp file host accepting `.zip` (e.g. litterbox.catbox.moe with `time=1h`).
+2. Delete the previous version on each backend:
+   - `CobbleHub` → `mods/cobblehub-quest-sync-<old>.jar`
+   - `CobbleHub_Monde` → `mods/cobblehub-quest-sync-<old>.jar`
+3. Upload the new jar via `sftp_upload_from_url` to each backend.
+4. Restart each backend (main first, then monde).
 
-## First-boot config wiring
+## First-boot config
 
-On the very first start with a new version, the mod regenerates the default config only if `config/cobblehub-quest-sync.json` is missing. Existing configs are preserved; new fields fall back to defaults via the backfill logic in `Config.loadOrCreate()`.
+The mod regenerates `config/cobblehub-quest-sync.json` only if missing. Existing configs are preserved; new fields backfill via `Config.loadOrCreate()`.
 
-If a new version introduces new mandatory fields, document them here.
+If a new version introduces a new mandatory field, document it here and in the README's version history.
 
-## Validating a deployment
+## Validation
 
-After restart, verify via RCON:
-
-```
-mods                       # 'CobbleHub Quest Sync' should appear in the list
-```
-
-And via SFTP:
+### Boot log
 
 ```
-config/cobblehub-quest-sync.json   # exists, contains expected values
+[cobblehub_quest_sync/]: CobblehubQuestSync v<version> starting...
+[cobblehub_quest_sync/]: Loaded config. serverName='<name>', mysql.enabled=true, firstJoin.enabled=<bool>, firstJoin.flagKey='<key>'
+[cobblehub_quest_sync/]: MySQL pool ready and schema migrated (prefix='cobblehub_').
+[cobblehub_quest_sync/]: Registered FTB Quests event listeners (capture + replay).
+[cobblehub_quest_sync/]: CobblehubQuestSync v<version> ready.
 ```
 
-Then connect with a test account. First connection should teleport to the configured tutorial coords. Second connection should *not* teleport.
+If MySQL init fails the mod boots in no-op mode — fix config and restart.
 
-## v0.1.0 deployment log
+### Functional test (quest sync)
 
-- Built locally in sandbox, Gradle 8.10.2 + Loom 1.7 + Java 21.
-- Jar size: 5,530,841 bytes (sha256 d70f61bc8b5fd3419cf1b2c07511f78fff90f028a29ee1a25f5ac52c7ce78f9e).
-- Deployed to CobbleHub (main) on 2026-05-29.
-- First-join TP and MySQL persistence validated end-to-end.
-- CobbleHub_Monde: jar deployed, awaiting per-server config wiring and restart.
+With both servers running and a test quest book in place:
+1. Connect to `main`, complete a checkmark task with a reward.
+2. Verify the reward was given exactly once.
+3. `/server monde` (or disconnect and reconnect).
+4. Open the quest book — the task should appear complete, the quest's cadre should be green, and the reward should NOT be granted again.
+5. Verify the log on monde shows:
+   ```
+   Replay for <player>: tasks=1, quests=1, chapters=<n>, rewards_marked=1, already_done=0, unknown_tasks=0.
+   ```
+
+### Functional test (first-join)
+
+1. Connect with a test account that has never been on the server.
+2. The player should be teleported to the configured tutorial coords.
+3. Disconnect, reconnect.
+4. The player should stay at the last known location (no second TP).
+
+## Deployment history
+
+| Version | Date       | Notes                                                                       |
+|---------|------------|-----------------------------------------------------------------------------|
+| v0.1.0  | 2026-05-29 | First-join TP. Main only initially, then Monde.                             |
+| v0.2.0  | 2026-05-29 | Quest sync MVP. Hit silent-logger bug, output looked like a no-op.          |
+| v0.2.1  | 2026-05-30 | Logger fix.                                                                 |
+| v0.2.2  | 2026-05-30 | Cascade fix.                                                                |
+| v0.2.3  | 2026-05-30 | Pre-mark rewards as claimed. Hit `NoSuchMethodError` on FTB 2101.1.3.       |
+| v0.2.4  | 2026-05-31 | Reflection fix. Validated end-to-end on CobbleHub + CobbleHub_Monde.        |
